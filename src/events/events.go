@@ -26,6 +26,31 @@ type TriggerFunctor interface {
 	TriggerHandler() TriggerToEvent
 }
 
+func CreateTrigger(src string, triggerReg TriggerRegister) (chan<- Trigger, error) {
+	toret := make(chan Trigger, 16)
+	if err := triggerReg.RegisterTrigger(src, toret); err != nil {
+		return nil, err
+	}
+	return toret, nil
+}
+
+func CreateListener(dst string, cond ListenForCondition, listenerReg ListenerRegister) (<-chan Event, error) {
+	toret := make(chan Event, 16)
+	if err := listenerReg.RegisterListener(dst, cond, toret); err != nil {
+		return nil, err
+	}
+	return toret, nil
+}
+
+func StartPipeline(triggers TriggerRegister, functor TriggerFunctor, listeners ListenerRegister) {
+	triggerStream := triggers.StartTriggerCombine()
+	go listeners.StartListenerLoop()
+	for trigger := range(triggerStream) {
+		event := functor.TriggerHandler()(trigger)
+		listeners.SendEvent(event)
+	}
+}
+
 type GenTriggerRegister struct {
 	sync.RWMutex
 	triggerMap map[string]<-chan Trigger
@@ -110,21 +135,19 @@ func (glr *GenListenerRegister)RegisterListener(dst string, cond ListenForCondit
 }
 
 func (glr *GenListenerRegister)StartListenerLoop() {
-	go func(*GenListenerRegister) {
-		for event := range(glr.eventStream) {
-			glr.RLock()
-			for _, listener := range(glr.listenerMap) {
-				if listener.Cond(event) {
-					select {
-					case listener.EventStream<-event:
-					default:
-						// If we can't push the event to the listener, it's not our problem.
-					}
+	for event := range(glr.eventStream) {
+		glr.RLock()
+		for _, listener := range(glr.listenerMap) {
+			if listener.Cond(event) {
+				select {
+				case listener.EventStream<-event:
+				default:
+					// If we can't push the event to the listener, it's not our problem.
 				}
 			}
-			glr.RUnlock()
 		}
-	}(glr)
+		glr.RUnlock()
+	}
 }
 
 func (glr *GenListenerRegister)SendEvent(event Event) {
@@ -133,14 +156,7 @@ func (glr *GenListenerRegister)SendEvent(event Event) {
 
 func NewEventPipeline(triggers TriggerRegister, functor TriggerFunctor, listeners ListenerRegister) *EventPipeline {
 	toret := &EventPipeline{ Triggers : triggers, Function : functor, Listeners : listeners }
-	go func(ep *EventPipeline) {
-		triggerStream := ep.Triggers.StartTriggerCombine()
-		ep.Listeners.StartListenerLoop()
-		for trigger := range(triggerStream) {
-			event := ep.Function.TriggerHandler()(trigger)
-			ep.Listeners.SendEvent(event)
-		}
-	}(toret)
+	go StartPipeline(toret.Triggers, toret.Function, toret.Listeners)
 	return toret
 }
 
@@ -152,17 +168,13 @@ func NewGenEventPipeline() *EventPipeline {
 }
 
 func (ep *EventPipeline)CreateTrigger(src string) (chan<- Trigger, error) {
-	toret := make(chan Trigger, 16)
-	if err := ep.Triggers.RegisterTrigger(src, toret); err != nil {
-		return nil, err
-	}
-	return toret, nil
+	return CreateTrigger(src, ep.Triggers)
 }
 
 func (ep *EventPipeline)CreateListener(dst string, cond ListenForCondition) (<-chan Event, error) {
-	toret := make(chan Event, 16)
-	if err := ep.Listeners.RegisterListener(dst, cond, toret); err != nil {
-		return nil, err
-	}
-	return toret, nil
+	return CreateListener(dst, cond, ep.Listeners)
+}
+
+func AlwaysTrue(_ Event) bool {
+	return true
 }
